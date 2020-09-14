@@ -1,0 +1,295 @@
+Prediction of execution of an exercise based on measurements of accelerometers
+==============================================================================
+
+Introduction
+------------
+
+Human Activity Recognition (HAR) has been an emergent field of research during
+the recent years. It promises many potential applications such as elderly
+monitoring, life log systems for monitoring energy expenditure and for
+supporting weight-loss programs, etc.
+([source](http://groupware.les.inf.puc-rio.br/har)). In this piece I deal with
+a problem where the goal is to predict "how well" an exercise was carried out.
+The prediction is based on the Weight Lifting Exercises Dataset which contains
+data about six individuals performing an exercise in different ways (correctly
+and in four typically mistaken ways). While exercising four sensors (arm,
+forearm, belt, dumbbell) were active to measure the activity. For this project
+I can use the predictors derived from these measurements (for further details
+see the 
+[original paper](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201)).
+ 
+The project was carried out in R (with a little help of a nice tool of
+[csv-fingerprint](https://github.com/setosa/csv-fingerprint)). In order to
+increase efficiency I use the `doMC` package for parallel computing. 
+
+```{r setoptions, echo=FALSE}
+opts_chunk$set(message=FALSE, warning=FALSE)
+```
+
+```{r initialization}
+# Load packages
+library(doMC)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(rattle)
+# use parallel computing for training the models
+registerDoMC(cores=4)
+```
+
+Exploratory analysis
+--------------------
+
+The data which is used for prediction is quite large. It consists 19,622
+observations in 160 variables. The first variables contain general data about
+the measurement (time, user, etc.), the last one is the classe variable ("A" if
+the exercise was performed correctly), and the remaining ones are various
+measurements from the sensors. I split the data into two parts: 60% of the
+observations will be used to train the models and the remaining 40% will serve
+as validation data. The final precision of the model is tested on the provided
+test set.
+
+```{r load data}
+# Load in the data
+#------------------
+data <- read.csv("../data/pml-training.csv")
+set.seed(20140820)
+index.train <- createDataPartition(data$classe, p=0.6)[[1]]
+training <- data[index.train, ]        # 60% 
+validation <- data[-index.train, ]     # 40%
+```
+
+As a first step, we can look at the data using the csv-fingerprint tool. As it
+is only able to deal with relatively small data, I randomly choose 2 percent of
+the observations from the training data and plug them into the tool. The
+resulting picture about the types of data can be seen on the figure below. We
+can see that most of the values are strings (colored by yellow) -- even those
+which are the measurement variables -- and there are also many empty cells
+(colored by dark blue).
+
+```{r check patterns}
+training2 <- sample_frac(training, 0.02) %>% arrange(X)
+
+write.table(training2, "../data/training2.csv", 
+            row.names=FALSE, col.names=FALSE, sep=",")
+```
+
+![Type pattern in 2% of training data](train2.png)
+Yellow: string, Blue: empty, Purple: decimal, Lightblue: integer
+
+* * *
+
+Based on these observed patterns in the data it is a good idea to reformat the
+measurement variables coded as string to numeric and to try to detect features
+with mostly missing values. 
+
+```{r reformat factor variables}
+# Reformat factor variables as numeric (lot of missing values will be created)
+all.data <- list(training=training,
+                 validation=validation)
+
+factors <- sapply(all.data$training, is.factor)
+# user name, etc, classe should not change
+factors[c(1:7, length(factors))] <- FALSE 
+
+ToNum <- function(x) {
+    num <- suppressWarnings(as.numeric(as.character(x)))
+}
+all.data$training[, factors] <- lapply(all.data$training[factors], ToNum)
+all.data$validation[, factors] <- lapply(all.data$validation[factors], ToNum)
+```
+
+We have observations from six individuals. In the table below I looked at some
+basic variables (roll pitch and yaw from four sensors) by the user's to see
+whether there is any pattern to worry about. We could observe that the
+measurements of arm for Jeremy are all zeros (and the measurements of forearm
+for Adelmo are zeros as well). They might have missed one of the sensors when
+exercising. 
+
+```{r missing patterns}
+# Check missing patterns
+Mode <- function(x) {
+    ux <- unique(x)
+    ux[which.max(tabulate(match(x, ux)))]
+}
+basevariables <- "^(roll_|pitch_|yaw_)(bell|arm|forearm|dumbbell)$"
+tb1 <- group_by(training, user_name) %>%
+        summarise_each(funs(mean), matches(basevariables))
+tb2 <- group_by(training, user_name) %>%
+        summarise(Mode(classe))
+inner_join(tb1, tb2, by="user_name")
+```
+
+However, our goal is to predict the type of the exercise based on the
+measurements from the movements, which should later apply to other users as
+well, so it is better not to use the information about the users.
+
+
+```{r ignore non-measurement variables}
+# Ignore variables like timestamp, etc.
+all.data <- lapply(all.data, function(x) { select(x, -(1:7)) } )
+```
+
+On the plot below we can see that more than half of the measurements are mainly
+missing (in more than 97.5 percent of the cases). Although I do not really
+understand the reason why they are missing, it is certainly better not to
+include these variables in the model building.
+
+```{r missing features, fig.height=4}
+# Try to exclude features which are mostly missing (remains 52, plus classe)
+missing.feat <- colMeans(sapply(all.data$training, is.na))
+qplot(missing.feat,
+      xlab = "Proportion of missing observation within features")
+index.nonmissing.feat <- which(missing.feat < 0.975)
+all.nonmiss <- lapply(all.data, function(x) {select(x, index.nonmissing.feat)})
+```
+
+After this simple cleaning process I end up with 52 features whose histograms
+can be seen on the plot below. They all seem to have normal variation with lots
+of zeros in some cases. 
+
+```{r histogram, fig.height=12, fig.width=12, message=FALSE}
+# Plot histograms from variables
+variables.to.plot <- select(all.nonmiss$training, -classe) %>%
+    gather(x, freq)
+ggplot(variables.to.plot, aes(x = freq)) +
+    facet_wrap(~x, scales="free_x") +
+    geom_histogram()
+```
+
+Model building
+--------------
+
+First, I build a simple tree model, based only on the base features.
+
+```{r base tree}
+base.data <- all.data$training %>% select(classe, matches(basevariables))
+base.tree <- train(classe ~ .,
+                   data=base.data,
+                   method="rpart") 
+```
+
+The model's performance on the validation set is quite poor. However, it is
+still a large improvement compared to the benchmark (we correctly specified
+the classe in 42 percent of the cases whereas there are 5 classes with
+close to equal prevalence).
+
+```{r base tree performance}
+# performance on validation set
+mean(predict(base.tree, validation) == validation$classe)
+```
+
+For the next step I choose to build a more complicated model on the same set of
+variables, a random forest. This results in a huge improvement, it is able to
+predict more than 93% of the cases correctly.
+
+```{r base forest}
+base.forest <- train(classe ~ .,
+                     data=base.data,
+                     method="rf") 
+# performance on validation set
+mean(predict(base.forest, validation) == validation$classe)
+```
+
+If I run the same model (random forest) on all of my (cleaned) data, I get
+a further improvement in accuracy reaching 99% on the validation set. From the
+confusion matrix we can also tell that the best (balanced) accuracy is reached
+for the classe "A" which denotes the correctly executed exercise. As I suspect
+that to differentiate between correct and incorrect exercise is more important
+than to differentiate between different types of incorrect ones, this is good
+news.
+
+```{r nonmissing forest all}
+# All non-missing, random forest, all
+nonmiss.forest.all <- train(classe ~ .,
+                            data=all.nonmiss$training,
+                            method="rf")
+# performance on validation set
+confusionMatrix(predict(nonmiss.forest.all, validation),
+                validation$classe)
+```
+
+In the following, I build two additional models: (1) a random forest which uses
+only the principal components of the variables which explain 90 percent of the
+total variance and (2) and a generalized boosted model using the `gbm` method
+of the `caret` package.
+
+```{r nonmissing forest 90pca}
+# All non-missing, random forest, pca 90%
+nonmiss.forest.pca <- train(classe ~ .,
+                            data=all.nonmiss$training,
+                            method="rf",
+                            preProcess="pca",
+                            trControl=trainControl(preProcOptions=(thresh=0.9)))
+# performance on validation set
+mean(predict(nonmiss.forest.pca, validation) == validation$classe)
+```
+
+```{r nonmissing boosting}
+# All non-missing, boosting 
+nonmiss.boost <- train(classe ~ .,
+                       data=all.nonmiss$training,
+                       method="gbm")
+# performance on validation set
+mean(predict(nonmiss.boost, validation) == validation$classe)
+```
+
+We can see that the random forest models perform better than the boosted one,
+and that the one which use all of the variables perform better than the
+preprocessed one (measured on the validation set). The random forest without
+principal component preprocessing reaches an accuracy of 99 percent. The other
+two models are slightly worse, but still very good: they predict the classe
+correctly in 96-97 percent of the cases. As ensembling different models
+together usually promises some accuracy gain (if there is at least some
+indepence between the models) I stack together the last three models by using
+the random forest method on the predictions. 
+
+```{r stack together}
+df.predicted <- data.frame(
+    pred.forest=predict(nonmiss.forest.pca, all.nonmiss$training),
+    pred.forest.pca=predict(nonmiss.forest.all, all.nonmiss$training),
+    pred.boost=predict(nonmiss.boost, all.nonmiss$training),
+    classe=all.nonmiss$training$classe
+)
+stacked <- train(classe ~ .,
+                 data=df.predicted,
+                 method="rf")
+# performance on validation set
+df.predicted.validation <- data.frame(
+    pred.forest=predict(nonmiss.forest.pca, all.nonmiss$validation),
+    pred.forest.pca=predict(nonmiss.forest.all, all.nonmiss$validation),
+    pred.boost=predict(nonmiss.boost, all.nonmiss$validation),
+    classe=all.nonmiss$validation$classe
+)
+mean(predict(stacked, df.predicted.validation) == validation$classe)
+```
+
+The performance of the stacked model is an accuracy of about 98 percent. The
+fact that it is slightly below the bigger random forest model might be due to
+the similarity of the models which were stacked together and to the already
+really high accuracy of one of the models. I think that 99 percent accuracy on
+the validation set is quite good so I choose the random forest model without
+prepocessing to be my final model. Its performance of a completely new data
+(like on the test set) might be slightly worse, but since I did not really do
+any fine-tuning based on the validation set results I do not expect this drop
+to matter.
+
+
+Conclusion
+----------
+
+This simple exercise showed us that applying some machine learning techniques
+which are basic today and easy to implement in R could result in a highly
+precise predictive model. As the last step I use my best model (the random
+forest model without preprocessing) to predict the test cases. It yielded a 100
+percent accuracy.
+
+```{r prediction on testing}
+testing <- read.csv("../data/pml-testing.csv")
+# apply the same transformations as before
+testing[, factors] <- lapply(all.data$validation[factors], ToNum)
+testing <- select(testing, -(1:7))
+testing <- select(testing, index.nonmissing.feat)
+answers <- predict(nonmiss.forest.all, testing)
+```
+ 
